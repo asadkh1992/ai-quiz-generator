@@ -52,137 +52,131 @@ def get_usage(admin, user_id):
     return 0
 
 
-# ---------------- EMAIL OTP LOGIN ----------------
 
-for key, default in {
-    "user_id": None,
-    "user_email": None,
-    "otp_email": "",
-    "otp_sent": False,
-    "quiz_df": None,
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+# --- QuizCraft AI: Email + Password Authentication ---
+import streamlit as st
 
+auth = get_auth_client()
 
-st.title("📝 QuizCraft AI")
-st.caption("Turn your study material into editable quizzes in minutes.")
-
-required_secrets = [
-    "SUPABASE_URL",
-    "SUPABASE_PUBLISHABLE_KEY",
-    "SUPABASE_SECRET_KEY",
-    "GROQ_API_KEY",
-]
-
-missing_secrets = [
-    key for key in required_secrets
-    if not st.secrets.get(key)
-]
-
-if missing_secrets:
-    st.error(
-        "Missing app secrets: "
-        + ", ".join(missing_secrets)
-        + ". Add them in Streamlit App Settings → Secrets."
-    )
-    st.stop()
-
-admin = get_admin_client(
-    st.secrets["SUPABASE_URL"],
-    st.secrets["SUPABASE_SECRET_KEY"],
-)
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+    st.session_state.user_email = None
 
 if not st.session_state.user_id:
-    st.subheader("Sign in with your email")
-    st.write(
-        "We'll email you a one-time verification code. "
-        "New email addresses can create an account automatically."
-    )
+    st.title("QuizCraft AI")
+    st.subheader("Sign in or create your account")
 
-    with st.form("send_otp_form"):
-        email_input = st.text_input(
-            "Email address",
-            value=st.session_state.otp_email,
-            placeholder="you@example.com",
-        ).strip().lower()
-        send_code = st.form_submit_button(
-            "Send verification code",
-            use_container_width=True,
-        )
+    signin_tab, signup_tab = st.tabs(["Sign in", "Create account"])
 
-    if send_code:
-        if not email_input or "@" not in email_input:
-            st.error("Enter a valid email address.")
-        else:
+    with signin_tab:
+        with st.form("signin_form"):
+            login_email = st.text_input("Email", key="login_email")
+            login_password = st.text_input(
+                "Password", type="password", key="login_password"
+            )
+            signin_clicked = st.form_submit_button(
+                "Sign in", use_container_width=True
+            )
+
+        if signin_clicked:
             try:
-                auth = get_auth_client()
-                auth.auth.sign_in_with_otp({
-                    "email": email_input,
-                    "options": {"should_create_user": True},
+                result = auth.auth.sign_in_with_password({
+                    "email": login_email.strip(),
+                    "password": login_password,
                 })
-                st.session_state.otp_email = email_input
-                st.session_state.otp_sent = True
-                st.success(
-                    "If the request was accepted, check your inbox "
-                    "and spam folder for the verification code."
-                )
-            except Exception as exc:
+
+                user = result.user
+                if user and getattr(user, "email_confirmed_at", None):
+                    st.session_state.user_id = str(user.id)
+                    st.session_state.user_email = user.email
+                    st.rerun()
+                else:
+                    st.error(
+                        "Please verify your email before accessing QuizCraft AI."
+                    )
+
+            except Exception:
                 st.error(
-                    f"Could not send the code: "
-                    f"{type(exc).__name__}: {exc}"
+                    "Sign-in failed. Check your email and password. "
+                    "If you just registered, verify your email first."
                 )
 
-    if st.session_state.otp_sent:
-        with st.form("verify_otp_form"):
-            st.caption(
-                f"Enter the code sent to {st.session_state.otp_email}."
+    with signup_tab:
+        with st.form("signup_form"):
+            signup_email = st.text_input("Email", key="signup_email")
+            signup_password = st.text_input(
+                "Create password (at least 8 characters)",
+                type="password",
+                key="signup_password",
             )
-            otp = st.text_input(
-                "Verification code",
-                max_chars=12,
-                placeholder="Enter the email code",
-            ).strip()
-            verify_code = st.form_submit_button(
-                "Verify and sign in",
-                use_container_width=True,
+            signup_confirm = st.text_input(
+                "Confirm password",
+                type="password",
+                key="signup_confirm",
+            )
+            signup_clicked = st.form_submit_button(
+                "Create account", use_container_width=True
             )
 
-        if verify_code:
-            if not otp:
-                st.error("Enter the code from your email.")
+        if signup_clicked:
+            email = signup_email.strip()
+
+            if not email or "@" not in email:
+                st.error("Please enter a valid email address.")
+            elif len(signup_password) < 8:
+                st.error("Your password must be at least 8 characters.")
+            elif signup_password != signup_confirm:
+                st.error("The passwords do not match.")
             else:
                 try:
-                    auth = get_auth_client()
-                    result = auth.auth.verify_otp({
-                        "email": st.session_state.otp_email,
-                        "token": otp,
-                        "type": "email",
+                    result = auth.auth.sign_up({
+                        "email": email,
+                        "password": signup_password,
                     })
 
-                    user = result.user
-                    if not user or not user.id:
-                        st.error(
-                            "Verification did not return a user. "
-                            "Please request a new code."
+                    if result.user and not result.session:
+                        st.success(
+                            "Account created! Check your email and click "
+                            "the verification link. Then return here and "
+                            "sign in with your email and password."
                         )
+                    elif result.user and result.session:
+                        # Do not grant access unless email is verified.
+                        if getattr(
+                            result.user, "email_confirmed_at", None
+                        ):
+                            st.session_state.user_id = str(result.user.id)
+                            st.session_state.user_email = result.user.email
+                            st.rerun()
+                        else:
+                            st.warning(
+                                "Please verify your email before signing in."
+                            )
                     else:
-                        st.session_state.user_id = str(user.id)
-                        st.session_state.user_email = (
-                            user.email or st.session_state.otp_email
+                        st.error(
+                            "Account creation did not complete. Please try again."
                         )
-                        st.session_state.otp_sent = False
-                        st.session_state.otp_email = ""
-                        st.success("Email verified.")
-                        st.rerun()
 
                 except Exception:
                     st.error(
-                        "Verification failed. Check the code and expiry, "
-                        "or request a new code."
+                        "Could not create the account. The email may already "
+                        "be registered, or email delivery may be unavailable. "
+                        "Please try signing in or try again later."
                     )
 
+    st.info(
+        "New users must verify their email before signing in. "
+        "After verification, return to this page and sign in."
+    )
     st.stop()
+
+# The user is signed in. Continue to your existing quiz-generation app below.
+st.sidebar.write(f"Signed in: {st.session_state.user_email}")
+
+if st.sidebar.button("Sign out"):
+    st.session_state.user_id = None
+    st.session_state.user_email = None
+    st.rerun()
 
 
 # ---------------- SIGNED-IN USER ----------------
