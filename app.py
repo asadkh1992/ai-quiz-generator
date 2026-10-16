@@ -95,12 +95,9 @@ if not st.session_state.user_id:
                         "Please verify your email before accessing QuizCraft AI."
                     )
 
-            except Exception:
-                st.error(
-                    "Sign-in failed. Check your email and password. "
-                    "If you just registered, verify your email first."
-                )
-
+            except Exception as e:
+    st.error(f"Sign-in failed: {e}")
+    
     with signup_tab:
         with st.form("signup_form"):
             signup_email = st.text_input("Email", key="signup_email")
