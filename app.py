@@ -386,7 +386,7 @@ for attempt in range(2):
     if not clean_questions:
         raise ValueError("No valid questions were returned.")
 
-    return pd.DataFrame(clean_questions)
+        return pd.DataFrame(clean_questions)
 
 
 # ---------------- WORD AND PDF EXPORT ----------------
