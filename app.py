@@ -38,6 +38,10 @@ def get_auth_client():
         st.secrets["SUPABASE_PUBLISHABLE_KEY"],
     )
 
+admin = get_admin_client(
+    st.secrets["SUPABASE_URL"],
+    st.secrets["SUPABASE_SECRET_KEY"],
+)
 
 def get_usage(admin, user_id):
     result = (
