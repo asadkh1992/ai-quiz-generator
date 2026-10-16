@@ -5,6 +5,9 @@ from xml.sax.saxutils import escape
 
 import pandas as pd
 import streamlit as st
+# Initialize quiz state before any UI accesses it
+if "quiz_df" not in st.session_state:
+    st.session_state.quiz_df = None
 from groq import Groq
 from supabase import create_client
 from pypdf import PdfReader
@@ -300,25 +303,56 @@ LEARNING MATERIAL:
 {source_text}
 """
 
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an educational assessment assistant. "
-                    "Use the supplied material and return valid JSON only."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_completion_tokens=6000,
-        response_format={"type": "json_object"},
-    )
+    
+import json
 
-    data = json.loads(response.choices[0].message.content)
-    questions = data.get("questions", [])
+response = None
+last_error = None
+
+for attempt in range(2):
+    try:
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an educational assessment assistant. "
+                        "Generate a quiz using the supplied material. "
+                        "Return exactly one valid JSON object and nothing else. "
+                        "Do not include Markdown fences or commentary. "
+                        "Follow the output structure requested in the user prompt."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        prompt
+                        + "\n\nReturn a single valid JSON object. "
+                        "Ensure all strings are correctly escaped."
+                    ),
+                },
+            ],
+            temperature=0.2,
+            max_completion_tokens=6000,
+            response_format={"type": "json_object"},
+        )
+
+        # Confirm that the model returned parseable JSON.
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("The model returned an empty response.")
+
+        quiz_data = json.loads(content)
+        break
+
+    except Exception as e:
+        last_error = e
+        response = None
+        if attempt == 1:
+            raise RuntimeError(
+                f"Quiz generation failed after two attempts: {last_error}"
+            ) from last_error
 
     if not isinstance(questions, list) or not questions:
         raise ValueError("The AI returned no usable questions.")
