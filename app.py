@@ -1,45 +1,244 @@
 
 import io
 import json
-import re
+from xml.sax.saxutils import escape
 
 import pandas as pd
 import streamlit as st
 from groq import Groq
+from supabase import create_client
 from pypdf import PdfReader
 from docx import Document
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer
-)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
 
 st.set_page_config(
     page_title="QuizCraft AI",
     page_icon="📝",
-    layout="wide"
+    layout="wide",
 )
+
+FREE_GENERATION_LIMIT = 3
+
+
+# ---------------- SUPABASE CLIENTS ----------------
+
+@st.cache_resource
+def get_admin_client(url, secret_key):
+    # Server-side database access only. Never expose this key.
+    return create_client(url, secret_key)
+
+
+def get_auth_client():
+    # Use the publishable key for email OTP authentication.
+    return create_client(
+        st.secrets["SUPABASE_URL"],
+        st.secrets["SUPABASE_PUBLISHABLE_KEY"],
+    )
+
+
+def get_usage(admin, user_id):
+    result = (
+        admin.table("user_usage")
+        .select("successful_generations")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if result.data:
+        return int(result.data[0]["successful_generations"])
+    return 0
+
+
+# ---------------- EMAIL OTP LOGIN ----------------
+
+for key, default in {
+    "user_id": None,
+    "user_email": None,
+    "otp_email": "",
+    "otp_sent": False,
+    "quiz_df": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
 
 st.title("📝 QuizCraft AI")
 st.caption("Turn your study material into editable quizzes in minutes.")
 
+required_secrets = [
+    "SUPABASE_URL",
+    "SUPABASE_PUBLISHABLE_KEY",
+    "SUPABASE_SECRET_KEY",
+    "GROQ_API_KEY",
+]
+
+missing_secrets = [
+    key for key in required_secrets
+    if not st.secrets.get(key)
+]
+
+if missing_secrets:
+    st.error(
+        "Missing app secrets: "
+        + ", ".join(missing_secrets)
+        + ". Add them in Streamlit App Settings → Secrets."
+    )
+    st.stop()
+
+admin = get_admin_client(
+    st.secrets["SUPABASE_URL"],
+    st.secrets["SUPABASE_SECRET_KEY"],
+)
+
+if not st.session_state.user_id:
+    st.subheader("Sign in with your email")
+    st.write(
+        "We'll email you a one-time verification code. "
+        "New email addresses can create an account automatically."
+    )
+
+    with st.form("send_otp_form"):
+        email_input = st.text_input(
+            "Email address",
+            value=st.session_state.otp_email,
+            placeholder="you@example.com",
+        ).strip().lower()
+        send_code = st.form_submit_button(
+            "Send verification code",
+            use_container_width=True,
+        )
+
+    if send_code:
+        if not email_input or "@" not in email_input:
+            st.error("Enter a valid email address.")
+        else:
+            try:
+                auth = get_auth_client()
+                auth.auth.sign_in_with_otp({
+                    "email": email_input,
+                    "options": {"should_create_user": True},
+                })
+                st.session_state.otp_email = email_input
+                st.session_state.otp_sent = True
+                st.success(
+                    "If the request was accepted, check your inbox "
+                    "and spam folder for the verification code."
+                )
+            except Exception as exc:
+                st.error(
+                    f"Could not send the code: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    if st.session_state.otp_sent:
+        with st.form("verify_otp_form"):
+            st.caption(
+                f"Enter the code sent to {st.session_state.otp_email}."
+            )
+            otp = st.text_input(
+                "Verification code",
+                max_chars=12,
+                placeholder="Enter the email code",
+            ).strip()
+            verify_code = st.form_submit_button(
+                "Verify and sign in",
+                use_container_width=True,
+            )
+
+        if verify_code:
+            if not otp:
+                st.error("Enter the code from your email.")
+            else:
+                try:
+                    auth = get_auth_client()
+                    result = auth.auth.verify_otp({
+                        "email": st.session_state.otp_email,
+                        "token": otp,
+                        "type": "email",
+                    })
+
+                    user = result.user
+                    if not user or not user.id:
+                        st.error(
+                            "Verification did not return a user. "
+                            "Please request a new code."
+                        )
+                    else:
+                        st.session_state.user_id = str(user.id)
+                        st.session_state.user_email = (
+                            user.email or st.session_state.otp_email
+                        )
+                        st.session_state.otp_sent = False
+                        st.session_state.otp_email = ""
+                        st.success("Email verified.")
+                        st.rerun()
+
+                except Exception:
+                    st.error(
+                        "Verification failed. Check the code and expiry, "
+                        "or request a new code."
+                    )
+
+    st.stop()
+
+
+# ---------------- SIGNED-IN USER ----------------
+
+user_id = st.session_state.user_id
+user_email = st.session_state.user_email or "Verified user"
+
+with st.sidebar:
+    st.success(f"Signed in: {user_email}")
+
+    if st.button("Sign out", use_container_width=True):
+        st.session_state.user_id = None
+        st.session_state.user_email = None
+        st.session_state.otp_email = ""
+        st.session_state.otp_sent = False
+        st.session_state.quiz_df = None
+        st.rerun()
+
+try:
+    used_count = get_usage(admin, user_id)
+except Exception as exc:
+    st.error(
+        "Could not read your usage record. "
+        "Check the Supabase table and server-side key. "
+        f"Details: {type(exc).__name__}: {exc}"
+    )
+    st.stop()
+
+remaining = max(0, FREE_GENERATION_LIMIT - used_count)
 st.info(
-    "Prototype version: generated questions should be reviewed "
-    "by a teacher before being used in an exam."
+    f"Free generations used: {used_count}/{FREE_GENERATION_LIMIT}. "
+    f"Remaining: {remaining}."
+)
+
+if remaining == 0:
+    st.warning(
+        "You've used your three free quiz generations. "
+        "Subscription billing is not connected yet."
+    )
+
+st.info(
+    "Prototype: review every generated question and answer "
+    "before using a quiz for teaching or assessment."
 )
 
 
+# ---------------- SOURCE EXTRACTION ----------------
+
 def extract_text(uploaded_file):
-    """Extract text from PDF, DOCX or TXT."""
     name = uploaded_file.name.lower()
 
     if name.endswith(".pdf"):
         reader = PdfReader(uploaded_file)
-        pages = []
-        for page in reader.pages:
-            pages.append(page.extract_text() or "")
-        return "\n".join(pages)
+        return "\n".join(
+            page.extract_text() or "" for page in reader.pages
+        )
 
     if name.endswith(".docx"):
         document = Document(uploaded_file)
@@ -55,6 +254,8 @@ def extract_text(uploaded_file):
     raise ValueError("Unsupported file format.")
 
 
+# ---------------- QUIZ GENERATION ----------------
+
 def generate_quiz(
     source_text,
     subject,
@@ -68,7 +269,7 @@ def generate_quiz(
 
     prompt = f"""
 Create a high-quality quiz using ONLY the learning material below.
-Do not invent facts that are not supported by the material.
+Do not invent facts unsupported by the material.
 If the material is insufficient, make fewer questions rather than
 inventing unsupported answers.
 
@@ -79,7 +280,7 @@ Question format: {question_type}
 Requested number of questions: {number_of_questions}
 Language: {language}
 
-Return valid JSON only, using this exact structure:
+Return valid JSON only, using this structure:
 {{
   "questions": [
     {{
@@ -92,13 +293,13 @@ Return valid JSON only, using this exact structure:
 }}
 
 Rules:
-- For multiple choice, provide exactly four options and one correct answer.
-- For true/false, provide options ["True", "False"].
+- For multiple choice, provide exactly four options and one answer.
+- For true/false, use options ["True", "False"].
 - For short answer, use an empty options list.
-- The correct_answer must match an option exactly for MCQs and true/false.
+- The correct_answer must exactly match an option for MCQ and true/false.
 - Avoid duplicate questions.
 - Keep explanations concise.
-- Do not include markdown fences around the JSON.
+- Do not include markdown fences around JSON.
 
 LEARNING MATERIAL:
 {source_text}
@@ -111,8 +312,7 @@ LEARNING MATERIAL:
                 "role": "system",
                 "content": (
                     "You are an educational assessment assistant. "
-                    "Follow the supplied source material and output "
-                    "valid JSON only."
+                    "Use the supplied material and return valid JSON only."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -122,14 +322,14 @@ LEARNING MATERIAL:
         response_format={"type": "json_object"},
     )
 
-    content = response.choices[0].message.content
-    data = json.loads(content)
+    data = json.loads(response.choices[0].message.content)
     questions = data.get("questions", [])
 
     if not isinstance(questions, list) or not questions:
         raise ValueError("The AI returned no usable questions.")
 
     clean_questions = []
+
     for item in questions:
         if not isinstance(item, dict):
             continue
@@ -151,9 +351,7 @@ LEARNING MATERIAL:
             "Correct answer": str(
                 item.get("correct_answer", "")
             ).strip(),
-            "Explanation": str(
-                item.get("explanation", "")
-            ).strip(),
+            "Explanation": str(item.get("explanation", "")).strip(),
         })
 
     if not clean_questions:
@@ -162,26 +360,23 @@ LEARNING MATERIAL:
     return pd.DataFrame(clean_questions)
 
 
+# ---------------- WORD AND PDF EXPORT ----------------
+
 def make_docx(df, title):
     document = Document()
     document.add_heading(title, 0)
 
     for index, row in df.iterrows():
-        document.add_heading(
-            f"Question {index + 1}", level=2
-        )
+        document.add_heading(f"Question {index + 1}", level=2)
         document.add_paragraph(str(row["Question"]))
 
         for column in ["Option A", "Option B", "Option C", "Option D"]:
             value = str(row[column]).strip()
             if value and value.lower() != "nan":
-                document.add_paragraph(
-                    f"{column}: {value}"
-                )
+                document.add_paragraph(f"{column}: {value}")
 
-        document.add_paragraph(
-            f"Answer: {row['Correct answer']}"
-        )
+        document.add_paragraph(f"Answer: {row['Correct answer']}")
+
         explanation = str(row["Explanation"]).strip()
         if explanation and explanation.lower() != "nan":
             document.add_paragraph(f"Explanation: {explanation}")
@@ -202,35 +397,46 @@ def make_pdf(df, title):
         bottomMargin=45,
     )
     styles = getSampleStyleSheet()
-    story = [Paragraph(title, styles["Title"]), Spacer(1, 16)]
+
+    story = [
+        Paragraph(escape(str(title)), styles["Title"]),
+        Spacer(1, 16),
+    ]
 
     for index, row in df.iterrows():
-        story.append(Paragraph(
-            f"<b>Question {index + 1}</b>",
-            styles["Heading3"],
-        ))
-        story.append(Paragraph(
-            str(row["Question"]), styles["BodyText"]
-        ))
+        story.append(
+            Paragraph(f"<b>Question {index + 1}</b>", styles["Heading3"])
+        )
+        story.append(
+            Paragraph(escape(str(row["Question"])), styles["BodyText"])
+        )
 
         for column in ["Option A", "Option B", "Option C", "Option D"]:
             value = str(row[column]).strip()
             if value and value.lower() != "nan":
-                story.append(Paragraph(
-                    f"{column}: {value}", styles["BodyText"]
-                ))
+                story.append(
+                    Paragraph(
+                        escape(f"{column}: {value}"),
+                        styles["BodyText"],
+                    )
+                )
 
-        story.append(Paragraph(
-            f"<b>Answer:</b> {row['Correct answer']}",
-            styles["BodyText"],
-        ))
+        story.append(
+            Paragraph(
+                "<b>Answer:</b> "
+                + escape(str(row["Correct answer"])),
+                styles["BodyText"],
+            )
+        )
 
         explanation = str(row["Explanation"]).strip()
         if explanation and explanation.lower() != "nan":
-            story.append(Paragraph(
-                f"<b>Explanation:</b> {explanation}",
-                styles["BodyText"],
-            ))
+            story.append(
+                Paragraph(
+                    "<b>Explanation:</b> " + escape(explanation),
+                    styles["BodyText"],
+                )
+            )
 
         story.append(Spacer(1, 12))
 
@@ -238,18 +444,16 @@ def make_pdf(df, title):
     return output.getvalue()
 
 
+# ---------------- QUIZ INPUTS ----------------
+
 with st.sidebar:
     st.header("Quiz settings")
     subject = st.text_input("Subject", value="General Science")
     level = st.selectbox(
         "Learner level",
         [
-            "Primary school",
-            "Middle school",
-            "Secondary school",
-            "College",
-            "University",
-            "Professional training",
+            "Primary school", "Middle school", "Secondary school",
+            "College", "University", "Professional training",
         ],
     )
     difficulty = st.selectbox(
@@ -260,22 +464,20 @@ with st.sidebar:
         ["Multiple choice", "True/False", "Short answer"],
     )
     number_of_questions = st.slider(
-        "Number of questions", min_value=3, max_value=15, value=5
+        "Number of questions", 3, 15, 5
     )
-    language = st.selectbox(
-        "Quiz language", ["English", "Urdu"]
-    )
+    language = st.selectbox("Quiz language", ["English", "Urdu"])
+
 
 uploaded_file = st.file_uploader(
     "Upload study material",
     type=["pdf", "docx", "txt"],
-    help="Use a text-based PDF. Scanned images may need OCR.",
+    help="Use a text-based PDF. Scanned PDFs may need OCR.",
 )
-
 pasted_text = st.text_area(
     "Or paste your notes here",
     height=180,
-    placeholder="Paste your lesson, notes, chapter excerpt or study material...",
+    placeholder="Paste your lesson, notes or study material...",
 )
 
 source_text = ""
@@ -294,58 +496,95 @@ if pasted_text.strip():
 
 if source_text:
     st.caption(
-        f"Source: {source_name} · "
-        f"{len(source_text):,} characters extracted"
+        f"Source: {source_name} · {len(source_text):,} characters extracted"
     )
-
     if len(source_text) > 30000:
         st.warning(
-            "Only the first 30,000 characters will be used in this prototype."
+            "Only the first 30,000 characters will be used."
         )
         source_text = source_text[:30000]
 
-if "quiz_df" not in st.session_state:
-    st.session_state.quiz_df = None
+
+# ---------------- RESERVE, GENERATE, COMMIT ----------------
 
 if st.button(
     "✨ Generate quiz",
     type="primary",
     use_container_width=True,
+    disabled=(remaining <= 0),
 ):
     if not source_text.strip():
         st.warning("Upload a file or paste study material first.")
     elif len(source_text.strip()) < 100:
-        st.warning(
-            "Please provide at least 100 characters of learning material."
-        )
-    elif not st.secrets.get("GROQ_API_KEY"):
-        st.error("GROQ_API_KEY is missing from the app secrets.")
+        st.warning("Please provide at least 100 characters of material.")
     else:
+        reservation_id = None
+
         try:
-            with st.spinner("Reading material and creating questions..."):
-                new_df = generate_quiz(
-                    source_text=source_text,
-                    subject=subject,
-                    level=level,
-                    difficulty=difficulty,
-                    question_type=question_type,
-                    number_of_questions=number_of_questions,
-                    language=language,
+            reservation = admin.rpc(
+                "reserve_quiz_generation",
+                {"p_user_id": user_id},
+            ).execute()
+
+            reservation_id = reservation.data
+
+            if not reservation_id:
+                st.warning(
+                    "Your three free generations have been used, "
+                    "or another generation is already in progress. "
+                    "Please check your usage and try again."
                 )
-            st.session_state.quiz_df = new_df
-            st.success(f"Generated {len(new_df)} questions.")
+            else:
+                with st.spinner("Creating your quiz..."):
+                    new_df = generate_quiz(
+                        source_text=source_text,
+                        subject=subject,
+                        level=level,
+                        difficulty=difficulty,
+                        question_type=question_type,
+                        number_of_questions=number_of_questions,
+                        language=language,
+                    )
+
+                committed = admin.rpc(
+                    "commit_quiz_generation",
+                    {"p_reservation_id": str(reservation_id)},
+                ).execute()
+
+                if not committed.data:
+                    raise RuntimeError(
+                        "The generation could not be recorded. "
+                        "Please try again."
+                    )
+
+                st.session_state.quiz_df = new_df
+                st.success(f"Generated {len(new_df)} questions.")
+                st.rerun()
+
         except Exception as exc:
+            if reservation_id:
+                try:
+                    admin.rpc(
+                        "release_quiz_generation",
+                        {"p_reservation_id": str(reservation_id)},
+                    ).execute()
+                except Exception:
+                    pass
+
             st.error(
-                "Quiz generation failed. Check your Groq API key, "
-                "model access and API limits. Details: "
-                f"{type(exc).__name__}: {exc}"
+                "Quiz generation failed. If the issue persists, "
+                "check your Groq model access, API limits and Supabase "
+                f"configuration. Details: {type(exc).__name__}: {exc}"
             )
+
+
+# ---------------- EDIT AND DOWNLOAD ----------------
 
 if st.session_state.quiz_df is not None:
     st.divider()
     st.header("Review and edit your quiz")
     st.caption(
-        "Click any cell to edit it. Check every answer before distributing the quiz."
+        "Click any cell to edit it. Check answers before distributing."
     )
 
     edited_df = st.data_editor(
@@ -365,9 +604,7 @@ if st.session_state.quiz_df is not None:
     )
     st.session_state.quiz_df = edited_df
 
-    quiz_title = st.text_input(
-        "Quiz title", value=f"{subject} Quiz"
-    )
+    quiz_title = st.text_input("Quiz title", value=f"{subject} Quiz")
 
     col1, col2 = st.columns(2)
 
@@ -376,7 +613,10 @@ if st.session_state.quiz_df is not None:
             "Download Word (.docx)",
             data=make_docx(edited_df, quiz_title),
             file_name="quiz.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
             use_container_width=True,
         )
 
