@@ -96,7 +96,7 @@ if not st.session_state.user_id:
                     )
 
             except Exception as e:
-    st.error(f"Sign-in failed: {e}")
+                st.error(f"Sign-in failed: {e}")
     
     with signup_tab:
         with st.form("signup_form"):
